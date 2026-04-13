@@ -1,0 +1,73 @@
+name: Sync docs to Google Drive
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+jobs:
+  sync:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write  # needed to commit updated gdoc-map.json
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Get changed and deleted .md files from PR
+        id: changed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          REPO=${{ github.repository }}
+
+          # Fetch all files changed in this PR
+          FILES=$(gh api repos/$REPO/pulls/$PR_NUMBER/files --paginate \
+            --jq '.[] | select(.filename | endswith(".md")) | [.status, .filename] | @tsv')
+
+          CHANGED=""
+          DELETED=""
+          while IFS=$'\t' read -r status filename; do
+            if [ "$status" = "removed" ]; then
+              DELETED="$DELETED $filename"
+            else
+              CHANGED="$CHANGED $filename"
+            fi
+          done <<< "$FILES"
+
+          echo "changed=${CHANGED# }" >> $GITHUB_OUTPUT
+          echo "deleted=${DELETED# }" >> $GITHUB_OUTPUT
+
+      - name: Write service account key to file
+        run: echo '${{ secrets.GOOGLE_SERVICE_ACCOUNT_KEY }}' > /tmp/sa-key.json
+
+      - name: Run sync script
+        env:
+          GOOGLE_SERVICE_ACCOUNT_KEY: /tmp/sa-key.json
+          GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GDRIVE_ROOT_FOLDER_ID }}
+          CHANGED_FILES: ${{ steps.changed.outputs.changed }}
+          DELETED_FILES: ${{ steps.changed.outputs.deleted }}
+        run: python scripts/sync.py
+
+      - name: Commit updated gdoc-map.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add gdoc-map.json
+          git diff --cached --quiet || git commit -m "chore: update gdoc-map.json after PR #${{ github.event.pull_request.number }}"
+          git push
